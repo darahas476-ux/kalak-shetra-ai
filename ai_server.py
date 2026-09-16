@@ -1,5 +1,10 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  KALAK SHETRA — AI BACKEND (REST-only, no SDKs)
+#  KALAK SHETRA — AI BACKEND (REST-only)
+#  • Background removal  → remove.bg API
+#  • Speech-to-Text      → Sarvam REST (Saarika v2)
+#  • Text-to-Speech      → Sarvam REST (Bulbul v2)
+#  • Translation         → Google Translate (free)
+#  • Chat assistant      → Grok 4.1 Fast
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os, io, base64, requests
@@ -20,8 +25,16 @@ app.add_middleware(
 )
 
 REMOVEBG_KEY = os.getenv("REMOVEBG_API_KEY", "")
-SARVAM_KEY = os.getenv("SARVAM_API_KEY", "")
-XAI_KEY = os.getenv("XAI_API_KEY", "")
+SARVAM_KEY   = os.getenv("SARVAM_API_KEY", "")
+XAI_KEY      = os.getenv("XAI_API_KEY", "")
+
+# ── Working Grok model (verified list as of 2026) ──
+GROK_MODEL = "grok-4-1-fast-non-reasoning"
+
+# ── Valid Sarvam Bulbul v2 speakers ──
+# Female: anushka, manisha, vidya, arya
+# Male:   abhilash, karun, hitesh
+DEFAULT_SPEAKER = "anushka"
 
 grok = None
 if XAI_KEY:
@@ -35,11 +48,12 @@ def root():
         "removebg_configured": bool(REMOVEBG_KEY),
         "sarvam_configured": bool(SARVAM_KEY),
         "grok_configured": bool(XAI_KEY),
+        "grok_model": GROK_MODEL,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  ENHANCE — remove.bg
+#  ENHANCE
 # ─────────────────────────────────────────────────────────────
 @app.post("/enhance")
 async def enhance(file: UploadFile = File(...)):
@@ -65,7 +79,7 @@ async def enhance(file: UploadFile = File(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-#  TRANSLATE — Google (free)
+#  TRANSLATE
 # ─────────────────────────────────────────────────────────────
 LANG = {"en":"en","en_US":"en","hi":"hi","hi_IN":"hi",
         "te":"te","te_IN":"te","auto":"auto"}
@@ -88,7 +102,7 @@ async def translate(text: str = Form(...), source: str = Form("auto"),
 
 
 # ─────────────────────────────────────────────────────────────
-#  SPEECH-TO-TEXT — Sarvam REST API
+#  SPEECH-TO-TEXT — Sarvam Saarika v2
 # ─────────────────────────────────────────────────────────────
 @app.post("/speech-to-text")
 async def speech_to_text(file: UploadFile = File(...),
@@ -107,7 +121,7 @@ async def speech_to_text(file: UploadFile = File(...),
         )
         if r.status_code != 200:
             return JSONResponse(
-                {"error": f"Sarvam STT {r.status_code}: {r.text[:300]}"},
+                {"error": f"Sarvam STT {r.status_code}: {r.text[:400]}"},
                 status_code=500,
             )
         return {"transcript": r.json().get("transcript", "")}
@@ -116,22 +130,29 @@ async def speech_to_text(file: UploadFile = File(...),
 
 
 # ─────────────────────────────────────────────────────────────
-#  TEXT-TO-SPEECH — Sarvam REST API
+#  TEXT-TO-SPEECH — Sarvam Bulbul v2
+#  Valid speakers: anushka, manisha, vidya, arya,
+#                  abhilash, karun, hitesh
 # ─────────────────────────────────────────────────────────────
 class TTSRequest(BaseModel):
     text: str
     language: str = "te-IN"
-    speaker: str = "meera"
+    speaker: str = DEFAULT_SPEAKER
 
 @app.post("/text-to-speech")
 async def text_to_speech(req: TTSRequest):
     if not SARVAM_KEY:
         return JSONResponse({"error": "SARVAM_API_KEY not set"}, status_code=503)
     try:
+        # Sanitize speaker — fall back to default if unknown
+        valid = {"anushka","manisha","vidya","arya",
+                 "abhilash","karun","hitesh"}
+        speaker = req.speaker if req.speaker in valid else DEFAULT_SPEAKER
+
         payload = {
             "text": req.text,
             "target_language_code": req.language,
-            "speaker": req.speaker,
+            "speaker": speaker,
             "model": "bulbul:v2",
         }
         headers = {
@@ -144,7 +165,7 @@ async def text_to_speech(req: TTSRequest):
         )
         if r.status_code != 200:
             return JSONResponse(
-                {"error": f"Sarvam TTS {r.status_code}: {r.text[:300]}"},
+                {"error": f"Sarvam TTS {r.status_code}: {r.text[:400]}"},
                 status_code=500,
             )
         audios = r.json().get("audios", [])
@@ -156,7 +177,7 @@ async def text_to_speech(req: TTSRequest):
 
 
 # ─────────────────────────────────────────────────────────────
-#  CHAT — Grok
+#  CHAT — Grok 4.1 Fast
 # ─────────────────────────────────────────────────────────────
 class ChatMessage(BaseModel):
     role: str
@@ -168,7 +189,8 @@ class ChatRequest(BaseModel):
 SYSTEM_PROMPT = (
     "You are Kalak Shetra's helpful seller assistant for Indian artisans. "
     "Help with pricing, product descriptions, festival tips, business guidance. "
-    "Reply in the same language the user speaks. Keep answers short and practical."
+    "Reply in the same language the user speaks (Telugu, Hindi, or English). "
+    "Keep answers short, practical, and friendly."
 )
 
 @app.post("/chat")
@@ -181,7 +203,7 @@ async def chat(req: ChatRequest):
             msgs.append({"role": m.role, "content": m.content})
 
         resp = grok.chat.completions.create(
-            model="grok-2-1212",       # proven working model
+            model=GROK_MODEL,
             messages=msgs,
             temperature=0.7,
             max_tokens=400,
@@ -198,11 +220,11 @@ async def chat(req: ChatRequest):
 def debug():
     results = {}
 
-    # Grok
+    # Grok test
     if grok:
         try:
             r = grok.chat.completions.create(
-                model="grok-2-1212",
+                model=GROK_MODEL,
                 messages=[{"role": "user", "content": "Say OK"}],
                 max_tokens=10,
             )
@@ -220,7 +242,7 @@ def debug():
                 json={
                     "text": "నమస్కారం",
                     "target_language_code": "te-IN",
-                    "speaker": "meera",
+                    "speaker": DEFAULT_SPEAKER,
                     "model": "bulbul:v2",
                 },
                 headers={
@@ -239,7 +261,6 @@ def debug():
     else:
         results["sarvam_tts"] = {"ok": False, "error": "SARVAM_API_KEY not configured"}
 
-    # remove.bg — just report configured
     results["removebg"] = {"configured": bool(REMOVEBG_KEY)}
 
     return results
