@@ -2,7 +2,8 @@ fastapi
 uvicorn[standard]
 python-multipart
 pillow
-rembg[cpu]
+requests
 deep-translator
 openai
+sarvamai
 gunicorn
