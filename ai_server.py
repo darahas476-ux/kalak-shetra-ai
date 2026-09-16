@@ -36,7 +36,7 @@ GROK_MODEL = "grok-4.6"
 
 # ── Sarvam Bulbul v3 speakers ──
 # bulbul:v2 was deprecated. v3 speakers: priya, ishita, shubh, aditya, etc.
-SARVAM_SPEAKERS = ["priya", "ishita", "manisha", "shubh", "aditya"]
+SARVAM_SPEAKERS = ["priya", "ishita", "shubh", "aditya"]
 SARVAM_TTS_MODEL = "bulbul:v3"
 
 # ── Initialize Grok client ──
