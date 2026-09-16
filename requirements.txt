@@ -5,5 +5,4 @@ pillow
 requests
 deep-translator
 openai
-sarvamai
 gunicorn
