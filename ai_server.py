@@ -1,10 +1,10 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  KALAK SHETRA — AI BACKEND (REST-only)
+#  KALAK SHETRA — AI BACKEND
 #  • Background removal  → remove.bg API
 #  • Speech-to-Text      → Sarvam REST (Saarika v2)
-#  • Text-to-Speech      → Sarvam REST (Bulbul v2)
+#  • Text-to-Speech      → Sarvam REST (Bulbul v3)
 #  • Translation         → Google Translate (free)
-#  • Chat assistant      → Grok 4.1 Fast
+#  • Chat assistant      → xAI Grok (official xai-sdk)
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os, io, base64, requests
@@ -13,7 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List
-from openai import OpenAI
+
+# ── Official xAI SDK ──
+from xai_sdk import Client
+from xai_sdk.chat import system, user, assistant
 
 app = FastAPI(title="Kalak Shetra AI")
 
@@ -28,17 +31,18 @@ REMOVEBG_KEY = os.getenv("REMOVEBG_API_KEY", "")
 SARVAM_KEY   = os.getenv("SARVAM_API_KEY", "")
 XAI_KEY      = os.getenv("XAI_API_KEY", "")
 
-# ── Working Grok model (verified list as of 2026) ──
-GROK_MODEL = "grok-4-1-fast-non-reasoning"
+# ── Grok model ──
+GROK_MODEL = "grok-4.6"
 
-# ── Valid Sarvam Bulbul v2 speakers ──
-# Female: anushka, manisha, vidya, arya
-# Male:   abhilash, karun, hitesh
-DEFAULT_SPEAKER = "anushka"
+# ── Sarvam Bulbul v3 speakers ──
+# bulbul:v2 was deprecated. v3 speakers: priya, ishita, shubh, aditya, etc.
+SARVAM_SPEAKERS = ["priya", "ishita", "manisha", "shubh", "aditya"]
+SARVAM_TTS_MODEL = "bulbul:v3"
 
-grok = None
+# ── Initialize Grok client ──
+grok_client = None
 if XAI_KEY:
-    grok = OpenAI(api_key=XAI_KEY, base_url="https://api.x.ai/v1")
+    grok_client = Client(api_key=XAI_KEY)
 
 
 @app.get("/")
@@ -49,11 +53,13 @@ def root():
         "sarvam_configured": bool(SARVAM_KEY),
         "grok_configured": bool(XAI_KEY),
         "grok_model": GROK_MODEL,
+        "grok_sdk": "xai-sdk (official)",
+        "sarvam_tts_model": SARVAM_TTS_MODEL,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  ENHANCE
+#  ENHANCE — remove.bg
 # ─────────────────────────────────────────────────────────────
 @app.post("/enhance")
 async def enhance(file: UploadFile = File(...)):
@@ -130,54 +136,62 @@ async def speech_to_text(file: UploadFile = File(...),
 
 
 # ─────────────────────────────────────────────────────────────
-#  TEXT-TO-SPEECH — Sarvam Bulbul v2
-#  Valid speakers: anushka, manisha, vidya, arya,
-#                  abhilash, karun, hitesh
+#  TEXT-TO-SPEECH — Sarvam Bulbul v3
 # ─────────────────────────────────────────────────────────────
 class TTSRequest(BaseModel):
     text: str
     language: str = "te-IN"
-    speaker: str = DEFAULT_SPEAKER
+    speaker: str = ""
+
+def _sarvam_tts_call(text: str, lang: str, speaker: str) -> dict:
+    try:
+        r = requests.post(
+            "https://api.sarvam.ai/text-to-speech",
+            json={
+                "text": text,
+                "target_language_code": lang,
+                "speaker": speaker,
+                "model": SARVAM_TTS_MODEL,
+            },
+            headers={
+                "api-subscription-key": SARVAM_KEY,
+                "Content-Type": "application/json",
+            },
+            timeout=45,
+        )
+        if r.status_code != 200:
+            return {"ok": False, "error": f"{r.status_code}: {r.text[:200]}"}
+        audios = r.json().get("audios", [])
+        if not audios:
+            return {"ok": False, "error": "no audio in response"}
+        return {"ok": True, "audio": audios[0], "speaker": speaker}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 @app.post("/text-to-speech")
 async def text_to_speech(req: TTSRequest):
     if not SARVAM_KEY:
         return JSONResponse({"error": "SARVAM_API_KEY not set"}, status_code=503)
-    try:
-        # Sanitize speaker — fall back to default if unknown
-        valid = {"anushka","manisha","vidya","arya",
-                 "abhilash","karun","hitesh"}
-        speaker = req.speaker if req.speaker in valid else DEFAULT_SPEAKER
 
-        payload = {
-            "text": req.text,
-            "target_language_code": req.language,
-            "speaker": speaker,
-            "model": "bulbul:v2",
-        }
-        headers = {
-            "api-subscription-key": SARVAM_KEY,
-            "Content-Type": "application/json",
-        }
-        r = requests.post(
-            "https://api.sarvam.ai/text-to-speech",
-            json=payload, headers=headers, timeout=45,
-        )
-        if r.status_code != 200:
-            return JSONResponse(
-                {"error": f"Sarvam TTS {r.status_code}: {r.text[:400]}"},
-                status_code=500,
-            )
-        audios = r.json().get("audios", [])
-        if not audios:
-            return JSONResponse({"error": "No audio in response"}, status_code=500)
-        return {"audio": audios[0], "format": "wav"}
-    except Exception as e:
-        return JSONResponse({"error": f"TTS failed: {e}"}, status_code=500)
+    candidates = [req.speaker] if req.speaker else []
+    candidates += [s for s in SARVAM_SPEAKERS if s not in candidates]
+
+    last_error = None
+    for spk in candidates:
+        result = _sarvam_tts_call(req.text, req.language, spk)
+        if result["ok"]:
+            return {"audio": result["audio"], "format": "wav", "speaker": result["speaker"]}
+        last_error = result["error"]
+
+    return JSONResponse(
+        {"error": f"All speakers failed. Last: {last_error}"},
+        status_code=500,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
-#  CHAT — Grok 4.1 Fast
+#  CHAT — Grok via official xai-sdk
 # ─────────────────────────────────────────────────────────────
 class ChatMessage(BaseModel):
     role: str
@@ -195,40 +209,43 @@ SYSTEM_PROMPT = (
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    if grok is None:
+    if grok_client is None:
         return JSONResponse({"error": "XAI_API_KEY not set"}, status_code=503)
     try:
-        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for m in req.messages:
-            msgs.append({"role": m.role, "content": m.content})
-
-        resp = grok.chat.completions.create(
+        # Build the chat using the official xai-sdk
+        chat = grok_client.chat.create(
             model=GROK_MODEL,
-            messages=msgs,
-            temperature=0.7,
-            max_tokens=400,
+            messages=[system(SYSTEM_PROMPT)],
         )
-        return {"reply": resp.choices[0].message.content}
+        for m in req.messages:
+            if m.role == "user":
+                chat.append(user(m.content))
+            elif m.role == "assistant":
+                chat.append(assistant(m.content))
+
+        response = chat.sample()
+        return {"reply": response.content, "model": GROK_MODEL}
     except Exception as e:
         return JSONResponse({"error": f"Grok failed: {e}"}, status_code=500)
 
 
 # ─────────────────────────────────────────────────────────────
-#  DEBUG — test all APIs
+#  DEBUG
 # ─────────────────────────────────────────────────────────────
 @app.get("/debug")
 def debug():
-    results = {}
+    results = {"grok_sdk": "xai-sdk (official)"}
 
-    # Grok test
-    if grok:
+    # Grok test using official SDK
+    if grok_client:
         try:
-            r = grok.chat.completions.create(
+            chat = grok_client.chat.create(
                 model=GROK_MODEL,
-                messages=[{"role": "user", "content": "Say OK"}],
-                max_tokens=10,
+                messages=[system("You reply tersely.")],
             )
-            results["grok"] = {"ok": True, "reply": r.choices[0].message.content}
+            chat.append(user("Say OK"))
+            response = chat.sample()
+            results["grok"] = {"ok": True, "reply": response.content, "model": GROK_MODEL}
         except Exception as e:
             results["grok"] = {"ok": False, "error": str(e)[:400]}
     else:
@@ -236,28 +253,12 @@ def debug():
 
     # Sarvam TTS test
     if SARVAM_KEY:
-        try:
-            r = requests.post(
-                "https://api.sarvam.ai/text-to-speech",
-                json={
-                    "text": "నమస్కారం",
-                    "target_language_code": "te-IN",
-                    "speaker": DEFAULT_SPEAKER,
-                    "model": "bulbul:v2",
-                },
-                headers={
-                    "api-subscription-key": SARVAM_KEY,
-                    "Content-Type": "application/json",
-                },
-                timeout=30,
-            )
-            results["sarvam_tts"] = {
-                "ok": r.status_code == 200,
-                "status": r.status_code,
-                "body_preview": r.text[:400],
-            }
-        except Exception as e:
-            results["sarvam_tts"] = {"ok": False, "error": str(e)[:400]}
+        tts_results = []
+        for spk in SARVAM_SPEAKERS:
+            r = _sarvam_tts_call("నమస్కారం", "te-IN", spk)
+            tts_results.append({"speaker": spk, "ok": r["ok"],
+                                "error": r.get("error")})
+        results["sarvam_tts"] = tts_results
     else:
         results["sarvam_tts"] = {"ok": False, "error": "SARVAM_API_KEY not configured"}
 

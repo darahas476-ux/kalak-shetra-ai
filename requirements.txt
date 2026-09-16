@@ -4,5 +4,5 @@ python-multipart
 pillow
 requests
 deep-translator
-openai
+xai-sdk
 gunicorn
