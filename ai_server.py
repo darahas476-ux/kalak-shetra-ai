@@ -265,3 +265,76 @@ def debug():
     results["removebg"] = {"configured": bool(REMOVEBG_KEY)}
 
     return results
+
+# ─────────────────────────────────────────────────────────────
+#  /predict-price — AI pricing assistant
+#  Takes product info → returns suggested ₹ range
+# ─────────────────────────────────────────────────────────────
+class PriceRequest(BaseModel):
+    category: str
+    title: str
+    description: str
+
+@app.post("/predict-price")
+async def predict_price(req: PriceRequest):
+    # Step 1: Base price by category (INR, from Indian marketplace averages)
+    base_prices = {
+        "Sarees": 3200,
+        "Dresses": 1100,
+        "Handicrafts": 900,
+        "Jewelry": 650,
+    }
+    base = base_prices.get(req.category, 1200)
+
+    # Step 2: Keyword multipliers (real Indian marketplace patterns)
+    text = (req.title + " " + req.description).lower()
+    multipliers = 1.0
+    if "silk" in text: multipliers *= 1.9
+    if "banarasi" in text or "kanjivaram" in text: multipliers *= 1.6
+    if "handwoven" in text: multipliers *= 1.35
+    if "handmade" in text or "handcrafted" in text: multipliers *= 1.25
+    if "bridal" in text or "wedding" in text: multipliers *= 1.5
+    if "zari" in text or "gold" in text: multipliers *= 1.3
+    if "cotton" in text: multipliers *= 0.75
+    if "daily" in text or "casual" in text: multipliers *= 0.85
+    if "oxidized" in text: multipliers *= 0.9
+    if "pure" in text: multipliers *= 1.15
+
+    # Step 3: Word count bonus (longer, richer descriptions = premium)
+    word_count = len(req.description.split())
+    if word_count > 30: multipliers *= 1.1
+    if word_count > 60: multipliers *= 1.05
+
+    mid = base * multipliers
+    low = round(mid * 0.82)
+    high = round(mid * 1.18)
+    suggested = round((low + high) / 2 / 50) * 50  # round to nearest 50
+
+    # Step 4: Try to get an LLM estimate for smarter advice
+    explanation = f"Based on {req.category.lower()} pricing in Indian marketplaces"
+    try:
+        if grok_client:
+            chat = grok_client.chat.create(
+                model=GROK_MODEL,
+                messages=[system(
+                    "You are an Indian artisan marketplace pricing expert. "
+                    "Reply in ONE short sentence (max 20 words). "
+                    "Given a product, give a quick rationale for the price."
+                )],
+            )
+            chat.append(user(
+                f"Category: {req.category}\nTitle: {req.title}\n"
+                f"Description: {req.description}\n"
+                f"Suggested ₹ range: {low}-{high}"
+            ))
+            r = chat.sample()
+            explanation = r.content.strip()
+    except Exception:
+        pass
+
+    return {
+        "low": low,
+        "high": high,
+        "suggested": suggested,
+        "explanation": explanation,
+    }
