@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: kalak-shetra-ai
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 1 -k uvicorn.workers.UvicornWorker ai_server:app --bind 0.0.0.0:$PORT --timeout 120"
+    envVars:
+      - key: XAI_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
