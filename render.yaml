@@ -3,15 +3,10 @@ services:
     name: kalak-shetra-ai
     runtime: python
     plan: free
-    region: singapore
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn -w 1 -k uvicorn.workers.UvicornWorker ai_server:app --bind 0.0.0.0:$PORT --timeout 60"
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn ai_server:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: REMOVEBG_API_KEY
-        sync: false
-      - key: SARVAM_API_KEY
-        sync: false
-      - key: XAI_API_KEY
+      - key: GEMINI_API_KEY
         sync: false
       - key: PYTHON_VERSION
-        value: "3.11.9"
+        value: 3.11.0
