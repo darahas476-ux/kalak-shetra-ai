@@ -1,340 +1,487 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  KALAK SHETRA — AI BACKEND
-#  • Background removal  → remove.bg API
-#  • Speech-to-Text      → Sarvam REST (Saarika v2)
-#  • Text-to-Speech      → Sarvam REST (Bulbul v3)
-#  • Translation         → Google Translate (free)
-#  • Chat assistant      → xAI Grok (official xai-sdk)
+#  KALAK-SHETRA AI — FastAPI backend (Gemini + remove.bg only)
 # ═══════════════════════════════════════════════════════════════════════════
+import os
+import io
+import time
+import json
+import base64
+import logging
+import traceback
+from typing import List, Optional, Dict, Any
 
-import os, io, base64, requests
-from fastapi import FastAPI, UploadFile, File, Form
+import httpx
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List
 
-# ── Official xAI SDK ──
-from xai_sdk import Client
-from xai_sdk.chat import system, user, assistant
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-app = FastAPI(title="Kalak Shetra AI")
+# ─── Logging ──────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("kalak-shetra")
+
+# ─── App ──────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Kalak-Shetra AI",
+    description="AI backend for Kalakriti artisan marketplace",
+    version="21.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-REMOVEBG_KEY = os.getenv("REMOVEBG_API_KEY", "")
-SARVAM_KEY   = os.getenv("SARVAM_API_KEY", "")
-XAI_KEY      = os.getenv("XAI_API_KEY", "")
 
-# ── Grok model ──
-GROK_MODEL = "grok-4.6"
-
-# ── Sarvam Bulbul v3 speakers ──
-# bulbul:v2 was deprecated. v3 speakers: priya, ishita, shubh, aditya, etc.
-SARVAM_SPEAKERS = ["priya", "ishita", "shubh", "aditya"]
-SARVAM_TTS_MODEL = "bulbul:v3"
-
-# ── Initialize Grok client ──
-grok_client = None
-if XAI_KEY:
-    grok_client = Client(api_key=XAI_KEY)
-
-
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "removebg_configured": bool(REMOVEBG_KEY),
-        "sarvam_configured": bool(SARVAM_KEY),
-        "grok_configured": bool(XAI_KEY),
-        "grok_model": GROK_MODEL,
-        "grok_sdk": "xai-sdk (official)",
-        "sarvam_tts_model": SARVAM_TTS_MODEL,
-    }
+# ═══════════════════════════════════════════════════════════════════════════
+#  ENV HELPERS  (case-insensitive lookup)
+# ═══════════════════════════════════════════════════════════════════════════
+def env_get(*names: str) -> Optional[str]:
+    """Return the first non-empty env var matching any of the given names (case-insensitive)."""
+    for n in names:
+        v = os.getenv(n)
+        if v and v.strip():
+            return v.strip()
+    # case-insensitive fallback
+    lower_map = {k.lower(): v for k, v in os.environ.items()}
+    for n in names:
+        v = lower_map.get(n.lower())
+        if v and v.strip():
+            return v.strip()
+    return None
 
 
-# ─────────────────────────────────────────────────────────────
-#  ENHANCE — remove.bg
-# ─────────────────────────────────────────────────────────────
-@app.post("/enhance")
-async def enhance(file: UploadFile = File(...)):
-    if not REMOVEBG_KEY:
-        return JSONResponse({"error": "REMOVEBG_API_KEY not set"}, status_code=503)
+# ═══════════════════════════════════════════════════════════════════════════
+#  GEMINI KEY ROTATOR
+# ═══════════════════════════════════════════════════════════════════════════
+class GeminiKeyRotator:
+    """
+    Round-robin over multiple Gemini API keys.
+    Reads env vars: GEMINI_API_KEY_1 ... GEMINI_API_KEY_9 (+ GEMINI_API_KEY fallback)
+    Case-insensitive: gemini_api_1, GEMINI_API_KEY_1, Gemini_Api_1 all work.
+    """
+    def __init__(self):
+        self.keys: List[str] = []
+        seen = set()
+
+        for i in range(1, 10):
+            k = env_get(f"GEMINI_API_KEY_{i}", f"gemini_api_{i}")
+            if k and k not in seen:
+                self.keys.append(k)
+                seen.add(k)
+
+        legacy = env_get("GEMINI_API_KEY", "gemini_api_key")
+        if legacy and legacy not in seen:
+            self.keys.append(legacy)
+
+        self.current_index = 0
+        self.failed_until: Dict[str, float] = {}
+        log.info(f"🔑 Gemini rotator loaded {len(self.keys)} key(s)")
+
+    def current(self) -> Optional[str]:
+        if not self.keys:
+            return None
+        now = time.time()
+        for _ in range(len(self.keys)):
+            key = self.keys[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.keys)
+            if self.failed_until.get(key, 0) > now:
+                continue
+            return key
+        return min(self.keys, key=lambda k: self.failed_until.get(k, 0))
+
+    def mark_failed(self, key: str, cooldown_seconds: int = 3600):
+        self.failed_until[key] = time.time() + cooldown_seconds
+        log.warning(f"⚠️  Key ...{key[-6:]} cooled for {cooldown_seconds}s")
+
+    def mark_ok(self, key: str):
+        self.failed_until.pop(key, None)
+
+    def stats(self):
+        now = time.time()
+        return [
+            {
+                "suffix": f"...{k[-6:]}",
+                "available": self.failed_until.get(k, 0) <= now,
+                "cooldown_remaining": max(0, int(self.failed_until.get(k, 0) - now)),
+            }
+            for k in self.keys
+        ]
+
+    def count(self) -> int:
+        return len(self.keys)
+
+
+gemini_rotator = GeminiKeyRotator()
+
+
+def _is_quota_error(err: str) -> bool:
+    e = err.lower()
+    return any(x in e for x in [
+        "429", "quota", "rate limit", "rate_limit",
+        "resource_exhausted", "resource exhausted",
+        "permission_denied", "permission denied",
+        "invalid api key", "api key not valid",
+        "401", "403",
+    ])
+
+
+def gemini_generate(
+    prompt: Any,
+    model_name: str = "gemini-2.0-flash",
+    image_bytes: Optional[bytes] = None,
+    max_retries: Optional[int] = None,
+) -> str:
+    """Call Gemini with automatic key rotation on quota errors."""
     try:
-        raw = await file.read()
-        resp = requests.post(
-            "https://api.remove.bg/v1.0/removebg",
-            files={"image_file": ("image.jpg", raw, "image/jpeg")},
-            data={"size": "auto", "format": "jpg", "bg_color": "ffffff"},
-            headers={"X-Api-Key": REMOVEBG_KEY},
-            timeout=60,
-        )
-        if resp.status_code != 200:
-            return JSONResponse(
-                {"error": f"remove.bg {resp.status_code}: {resp.text[:300]}"},
-                status_code=500,
-            )
-        return {"image": base64.b64encode(resp.content).decode()}
-    except Exception as e:
-        return JSONResponse({"error": f"enhance failed: {e}"}, status_code=500)
+        import google.generativeai as genai
+    except ImportError:
+        raise HTTPException(status_code=500, detail="google-generativeai not installed")
 
+    if gemini_rotator.count() == 0:
+        raise HTTPException(status_code=500, detail="No Gemini API keys configured")
 
-# ─────────────────────────────────────────────────────────────
-#  TRANSLATE
-# ─────────────────────────────────────────────────────────────
-LANG = {"en":"en","en_US":"en","hi":"hi","hi_IN":"hi",
-        "te":"te","te_IN":"te","auto":"auto"}
-
-@app.post("/translate")
-async def translate(text: str = Form(...), source: str = Form("auto"),
-                    target: str = Form("en")):
-    try:
-        s = LANG.get(source, "auto")
-        t = LANG.get(target, "en")
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {"client":"gtx","sl":s,"tl":t,"dt":"t","q":text}
-        r = requests.get(url, params=params, timeout=15,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        data = r.json()
-        translated = "".join(seg[0] for seg in data[0] if seg and seg[0])
-        return {"translated": translated}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# ─────────────────────────────────────────────────────────────
-#  SPEECH-TO-TEXT — Sarvam Saarika v2
-# ─────────────────────────────────────────────────────────────
-@app.post("/speech-to-text")
-async def speech_to_text(file: UploadFile = File(...),
-                         language: str = Form("te-IN")):
-    if not SARVAM_KEY:
-        return JSONResponse({"error": "SARVAM_API_KEY not set"}, status_code=503)
-    try:
-        audio_bytes = await file.read()
-        files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
-        data = {"model": "saarika:v2", "language_code": language}
-        headers = {"api-subscription-key": SARVAM_KEY}
-
-        r = requests.post(
-            "https://api.sarvam.ai/speech-to-text",
-            files=files, data=data, headers=headers, timeout=60,
-        )
-        if r.status_code != 200:
-            return JSONResponse(
-                {"error": f"Sarvam STT {r.status_code}: {r.text[:400]}"},
-                status_code=500,
-            )
-        return {"transcript": r.json().get("transcript", "")}
-    except Exception as e:
-        return JSONResponse({"error": f"STT failed: {e}"}, status_code=500)
-
-
-# ─────────────────────────────────────────────────────────────
-#  TEXT-TO-SPEECH — Sarvam Bulbul v3
-# ─────────────────────────────────────────────────────────────
-class TTSRequest(BaseModel):
-    text: str
-    language: str = "te-IN"
-    speaker: str = ""
-
-def _sarvam_tts_call(text: str, lang: str, speaker: str) -> dict:
-    try:
-        r = requests.post(
-            "https://api.sarvam.ai/text-to-speech",
-            json={
-                "text": text,
-                "target_language_code": lang,
-                "speaker": speaker,
-                "model": SARVAM_TTS_MODEL,
-            },
-            headers={
-                "api-subscription-key": SARVAM_KEY,
-                "Content-Type": "application/json",
-            },
-            timeout=45,
-        )
-        if r.status_code != 200:
-            return {"ok": False, "error": f"{r.status_code}: {r.text[:200]}"}
-        audios = r.json().get("audios", [])
-        if not audios:
-            return {"ok": False, "error": "no audio in response"}
-        return {"ok": True, "audio": audios[0], "speaker": speaker}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-@app.post("/text-to-speech")
-async def text_to_speech(req: TTSRequest):
-    if not SARVAM_KEY:
-        return JSONResponse({"error": "SARVAM_API_KEY not set"}, status_code=503)
-
-    candidates = [req.speaker] if req.speaker else []
-    candidates += [s for s in SARVAM_SPEAKERS if s not in candidates]
-
+    attempts = max_retries or gemini_rotator.count()
     last_error = None
-    for spk in candidates:
-        result = _sarvam_tts_call(req.text, req.language, spk)
-        if result["ok"]:
-            return {"audio": result["audio"], "format": "wav", "speaker": result["speaker"]}
-        last_error = result["error"]
 
-    return JSONResponse(
-        {"error": f"All speakers failed. Last: {last_error}"},
-        status_code=500,
+    for attempt in range(attempts):
+        key = gemini_rotator.current()
+        if not key:
+            break
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(model_name)
+
+            if image_bytes is not None:
+                from PIL import Image
+                img = Image.open(io.BytesIO(image_bytes))
+                parts = [prompt, img] if isinstance(prompt, str) else [*prompt, img]
+                response = model.generate_content(parts)
+            else:
+                response = model.generate_content(prompt)
+
+            text = getattr(response, "text", None)
+            if not text:
+                try:
+                    text = response.candidates[0].content.parts[0].text
+                except Exception:
+                    text = ""
+
+            gemini_rotator.mark_ok(key)
+            return text or ""
+
+        except Exception as e:
+            err = str(e)
+            last_error = err
+            if _is_quota_error(err):
+                gemini_rotator.mark_failed(key, cooldown_seconds=3600)
+                log.warning(f"🔁 Gemini key failed, rotating ({attempt + 2}/{attempts})")
+                continue
+            log.error(f"Gemini non-quota error: {err}")
+            raise
+
+    raise HTTPException(
+        status_code=503,
+        detail=f"All Gemini keys exhausted. Last error: {last_error}",
     )
 
 
-# ─────────────────────────────────────────────────────────────
-#  CHAT — Grok via official xai-sdk
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  MODELS
+# ═══════════════════════════════════════════════════════════════════════════
 class ChatMessage(BaseModel):
     role: str
     content: str
 
+
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
 
-SYSTEM_PROMPT = (
-    "You are Kalak Shetra's helpful seller assistant for Indian artisans. "
-    "Help with pricing, product descriptions, festival tips, business guidance. "
-    "Reply in the same language the user speaks (Telugu, Hindi, or English). "
-    "Keep answers short, practical, and friendly."
-)
 
+class TranslateRequest(BaseModel):
+    text: str
+    target_lang: str = "en"
+
+
+class PricePredictRequest(BaseModel):
+    title: str
+    description: str = ""
+    category: str = "Handicrafts"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ROOT / HEALTH / DEBUG
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "kalak-shetra-ai",
+        "version": "21.1.0",
+        "gemini_keys": gemini_rotator.count(),
+        "removebg_configured": bool(env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@app.get("/debug")
+async def debug():
+    rbg = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
+    return {
+        "service": "kalak-shetra-ai",
+        "version": "21.1.0",
+        "gemini": {
+            "total_keys": gemini_rotator.count(),
+            "keys": gemini_rotator.stats(),
+        },
+        "removebg": {
+            "configured": bool(rbg),
+            "key_suffix": (rbg or "")[-6:],
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /analyze-product
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/analyze-product")
+async def analyze_product(
+    file: UploadFile = File(...),
+    user_desc: str = Form(""),
+):
+    try:
+        img_bytes = await file.read()
+        if not img_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        prompt = f"""You are an expert at Indian handicrafts, sarees, jewelry, and traditional crafts.
+
+Analyze this product image and respond with ONLY a valid JSON object (no markdown, no code fences).
+
+The user described it as: "{user_desc}" (may be empty).
+
+Return JSON with these exact keys:
+{{
+  "title": "short catchy title (max 60 chars)",
+  "description_en": "2-3 sentence English description (100-180 chars)",
+  "description_hi": "same description in Hindi (Devanagari)",
+  "category": "one of: Sarees, Dresses, Handicrafts, Jewelry",
+  "price_low": integer (INR, realistic low estimate),
+  "price_high": integer (INR, realistic high estimate),
+  "tags": ["tag1", "tag2", "tag3"],
+  "confidence": float between 0 and 1
+}}
+
+Return only the JSON."""
+
+        raw = gemini_generate(prompt, image_bytes=img_bytes).strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end > start:
+                parsed = json.loads(raw[start : end + 1])
+            else:
+                raise
+
+        return JSONResponse(parsed)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/analyze-product error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /enhance — remove background
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/enhance")
+async def enhance(file: UploadFile = File(...)):
+    try:
+        api_key = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="remove.bg API key not configured")
+
+        img_bytes = await file.read()
+        if not img_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "https://api.remove.bg/v1.0/removebg",
+                headers={"X-Api-Key": api_key},
+                files={"image_file": ("image.jpg", img_bytes, "image/jpeg")},
+                data={"size": "auto"},
+            )
+
+        if resp.status_code != 200:
+            log.error(f"remove.bg {resp.status_code}: {resp.text[:200]}")
+            return JSONResponse({
+                "image": base64.b64encode(img_bytes).decode(),
+                "warning": f"remove.bg returned {resp.status_code}, using original",
+            })
+
+        return JSONResponse({
+            "image": base64.b64encode(resp.content).decode(),
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/enhance error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /chat
+# ═══════════════════════════════════════════════════════════════════════════
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    if grok_client is None:
-        return JSONResponse({"error": "XAI_API_KEY not set"}, status_code=503)
     try:
-        # Build the chat using the official xai-sdk
-        chat = grok_client.chat.create(
-            model=GROK_MODEL,
-            messages=[system(SYSTEM_PROMPT)],
+        if not req.messages:
+            raise HTTPException(status_code=400, detail="No messages")
+
+        system = (
+            "You are Kalakriti Assistant, a helpful AI for Indian artisans "
+            "selling sarees, dresses, handicrafts, and jewelry. "
+            "Help with pricing, photography tips, festival sale planning, "
+            "and product descriptions. Be warm and concise. "
+            "Reply in the same language the user writes in (English, Hindi, Telugu)."
         )
+
+        lines = []
         for m in req.messages:
-            if m.role == "user":
-                chat.append(user(m.content))
-            elif m.role == "assistant":
-                chat.append(assistant(m.content))
+            role = "User" if m.role == "user" else "Assistant"
+            lines.append(f"{role}: {m.content}")
 
-        response = chat.sample()
-        return {"reply": response.content, "model": GROK_MODEL}
+        prompt = f"{system}\n\n" + "\n".join(lines) + "\nAssistant:"
+
+        reply = gemini_generate(prompt, model_name="gemini-2.0-flash")
+        return {"reply": reply.strip()}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        return JSONResponse({"error": f"Grok failed: {e}"}, status_code=500)
+        log.error(f"/chat error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─────────────────────────────────────────────────────────────
-#  DEBUG
-# ─────────────────────────────────────────────────────────────
-@app.get("/debug")
-def debug():
-    results = {"grok_sdk": "xai-sdk (official)"}
-
-    # Grok test using official SDK
-    if grok_client:
-        try:
-            chat = grok_client.chat.create(
-                model=GROK_MODEL,
-                messages=[system("You reply tersely.")],
-            )
-            chat.append(user("Say OK"))
-            response = chat.sample()
-            results["grok"] = {"ok": True, "reply": response.content, "model": GROK_MODEL}
-        except Exception as e:
-            results["grok"] = {"ok": False, "error": str(e)[:400]}
-    else:
-        results["grok"] = {"ok": False, "error": "XAI_API_KEY not configured"}
-
-    # Sarvam TTS test
-    if SARVAM_KEY:
-        tts_results = []
-        for spk in SARVAM_SPEAKERS:
-            r = _sarvam_tts_call("నమస్కారం", "te-IN", spk)
-            tts_results.append({"speaker": spk, "ok": r["ok"],
-                                "error": r.get("error")})
-        results["sarvam_tts"] = tts_results
-    else:
-        results["sarvam_tts"] = {"ok": False, "error": "SARVAM_API_KEY not configured"}
-
-    results["removebg"] = {"configured": bool(REMOVEBG_KEY)}
-
-    return results
-
-# ─────────────────────────────────────────────────────────────
-#  /predict-price — AI pricing assistant
-#  Takes product info → returns suggested ₹ range
-# ─────────────────────────────────────────────────────────────
-class PriceRequest(BaseModel):
-    category: str
-    title: str
-    description: str
-
+# ═══════════════════════════════════════════════════════════════════════════
+#  /predict-price
+# ═══════════════════════════════════════════════════════════════════════════
 @app.post("/predict-price")
-async def predict_price(req: PriceRequest):
-    # Step 1: Base price by category (INR, from Indian marketplace averages)
-    base_prices = {
-        "Sarees": 3200,
-        "Dresses": 1100,
-        "Handicrafts": 900,
-        "Jewelry": 650,
-    }
-    base = base_prices.get(req.category, 1200)
-
-    # Step 2: Keyword multipliers (real Indian marketplace patterns)
-    text = (req.title + " " + req.description).lower()
-    multipliers = 1.0
-    if "silk" in text: multipliers *= 1.9
-    if "banarasi" in text or "kanjivaram" in text: multipliers *= 1.6
-    if "handwoven" in text: multipliers *= 1.35
-    if "handmade" in text or "handcrafted" in text: multipliers *= 1.25
-    if "bridal" in text or "wedding" in text: multipliers *= 1.5
-    if "zari" in text or "gold" in text: multipliers *= 1.3
-    if "cotton" in text: multipliers *= 0.75
-    if "daily" in text or "casual" in text: multipliers *= 0.85
-    if "oxidized" in text: multipliers *= 0.9
-    if "pure" in text: multipliers *= 1.15
-
-    # Step 3: Word count bonus (longer, richer descriptions = premium)
-    word_count = len(req.description.split())
-    if word_count > 30: multipliers *= 1.1
-    if word_count > 60: multipliers *= 1.05
-
-    mid = base * multipliers
-    low = round(mid * 0.82)
-    high = round(mid * 1.18)
-    suggested = round((low + high) / 2 / 50) * 50  # round to nearest 50
-
-    # Step 4: Try to get an LLM estimate for smarter advice
-    explanation = f"Based on {req.category.lower()} pricing in Indian marketplaces"
+async def predict_price(req: PricePredictRequest):
     try:
-        if grok_client:
-            chat = grok_client.chat.create(
-                model=GROK_MODEL,
-                messages=[system(
-                    "You are an Indian artisan marketplace pricing expert. "
-                    "Reply in ONE short sentence (max 20 words). "
-                    "Given a product, give a quick rationale for the price."
-                )],
-            )
-            chat.append(user(
-                f"Category: {req.category}\nTitle: {req.title}\n"
-                f"Description: {req.description}\n"
-                f"Suggested ₹ range: {low}-{high}"
-            ))
-            r = chat.sample()
-            explanation = r.content.strip()
-    except Exception:
-        pass
+        prompt = f"""You are a pricing expert for Indian handicrafts. Based on:
 
-    return {
-        "low": low,
-        "high": high,
-        "suggested": suggested,
-        "explanation": explanation,
-    }
+Title: {req.title}
+Description: {req.description}
+Category: {req.category}
+
+Return ONLY valid JSON:
+{{
+  "price_low": integer in INR,
+  "price_high": integer in INR,
+  "price_recommended": integer in INR (midpoint),
+  "reasoning": "one sentence in English"
+}}"""
+
+        raw = gemini_generate(prompt, model_name="gemini-2.0-flash").strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            parsed = json.loads(raw[start : end + 1]) if start != -1 and end > start else {}
+
+        return JSONResponse(parsed)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/predict-price error: {e}")
+        base = {"Sarees": 2500, "Dresses": 1400, "Jewelry": 900}.get(req.category, 800)
+        return {
+            "price_low": base,
+            "price_high": int(base * 1.6),
+            "price_recommended": int(base * 1.3),
+            "reasoning": "Estimated from category baseline.",
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /translate
+# ═══════════════════════════════════════════════════════════════════════════
+@app.post("/translate")
+async def translate(req: TranslateRequest):
+    try:
+        prompt = (
+            f"Translate the following text to language code '{req.target_lang}'. "
+            f"Return ONLY the translation, no explanation, no quotes.\n\n"
+            f"Text: {req.text}"
+        )
+        translated = gemini_generate(prompt, model_name="gemini-2.0-flash")
+        return {"translated": translated.strip()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/translate error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ERROR HANDLER + STARTUP
+# ═══════════════════════════════════════════════════════════════════════════
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    log.error(f"Unhandled: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "type": type(exc).__name__},
+    )
+
+
+@app.on_event("startup")
+async def on_startup():
+    rbg = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
+    log.info("═" * 60)
+    log.info("🚀 Kalak-Shetra AI v21.1.0 starting")
+    log.info(f"   Gemini keys: {gemini_rotator.count()}")
+    log.info(f"   remove.bg: {'✅' if rbg else '❌'}")
+    log.info("═" * 60)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
