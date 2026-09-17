@@ -140,7 +140,7 @@ def _is_quota_error(err: str) -> bool:
 
 def gemini_generate(
     prompt: Any,
-    model_name: str = "gemini-2.0-flash",
+    model_name: str = "gemini-3.6-flash",
     image_bytes: Optional[bytes] = None,
     max_retries: Optional[int] = None,
 ) -> str:
@@ -380,7 +380,7 @@ async def chat(req: ChatRequest):
 
         prompt = f"{system}\n\n" + "\n".join(lines) + "\nAssistant:"
 
-        reply = gemini_generate(prompt, model_name="gemini-2.0-flash")
+        reply = gemini_generate(prompt, model_name="gemini-3.6-flash")
         return {"reply": reply.strip()}
 
     except HTTPException:
@@ -410,7 +410,7 @@ Return ONLY valid JSON:
   "reasoning": "one sentence in English"
 }}"""
 
-        raw = gemini_generate(prompt, model_name="gemini-2.0-flash").strip()
+        raw = gemini_generate(prompt, model_name="gemini-3.6-flash").strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -450,7 +450,7 @@ async def translate(req: TranslateRequest):
             f"Return ONLY the translation, no explanation, no quotes.\n\n"
             f"Text: {req.text}"
         )
-        translated = gemini_generate(prompt, model_name="gemini-2.0-flash")
+        translated = gemini_generate(prompt, model_name="gemini-3.6-flash")
         return {"translated": translated.strip()}
     except HTTPException:
         raise
