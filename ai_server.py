@@ -1,5 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  KALAK-SHETRA AI — FastAPI backend (Gemini + remove.bg only)
+#  v21.2.0 — Updated to gemini-3.6-flash
 # ═══════════════════════════════════════════════════════════════════════════
 import os
 import io
@@ -29,11 +30,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("kalak-shetra")
 
+# ─── Model name (single source of truth) ──────────────────────────────────
+GEMINI_MODEL = "gemini-3.6-flash"
+
 # ─── App ──────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Kalak-Shetra AI",
     description="AI backend for Kalakriti artisan marketplace",
-    version="21.0.0",
+    version="21.2.0",
 )
 
 app.add_middleware(
@@ -54,7 +58,6 @@ def env_get(*names: str) -> Optional[str]:
         v = os.getenv(n)
         if v and v.strip():
             return v.strip()
-    # case-insensitive fallback
     lower_map = {k.lower(): v for k, v in os.environ.items()}
     for n in names:
         v = lower_map.get(n.lower())
@@ -140,7 +143,7 @@ def _is_quota_error(err: str) -> bool:
 
 def gemini_generate(
     prompt: Any,
-    model_name: str = "gemini-3.6-flash",
+    model_name: str = GEMINI_MODEL,
     image_bytes: Optional[bytes] = None,
     max_retries: Optional[int] = None,
 ) -> str:
@@ -229,7 +232,8 @@ async def root():
     return {
         "status": "ok",
         "service": "kalak-shetra-ai",
-        "version": "21.1.0",
+        "version": "21.2.0",
+        "model": GEMINI_MODEL,
         "gemini_keys": gemini_rotator.count(),
         "removebg_configured": bool(env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")),
     }
@@ -245,7 +249,8 @@ async def debug():
     rbg = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
     return {
         "service": "kalak-shetra-ai",
-        "version": "21.1.0",
+        "version": "21.2.0",
+        "model": GEMINI_MODEL,
         "gemini": {
             "total_keys": gemini_rotator.count(),
             "keys": gemini_rotator.stats(),
@@ -380,7 +385,7 @@ async def chat(req: ChatRequest):
 
         prompt = f"{system}\n\n" + "\n".join(lines) + "\nAssistant:"
 
-        reply = gemini_generate(prompt, model_name="gemini-3.6-flash")
+        reply = gemini_generate(prompt)
         return {"reply": reply.strip()}
 
     except HTTPException:
@@ -410,7 +415,7 @@ Return ONLY valid JSON:
   "reasoning": "one sentence in English"
 }}"""
 
-        raw = gemini_generate(prompt, model_name="gemini-3.6-flash").strip()
+        raw = gemini_generate(prompt).strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -450,7 +455,7 @@ async def translate(req: TranslateRequest):
             f"Return ONLY the translation, no explanation, no quotes.\n\n"
             f"Text: {req.text}"
         )
-        translated = gemini_generate(prompt, model_name="gemini-3.6-flash")
+        translated = gemini_generate(prompt)
         return {"translated": translated.strip()}
     except HTTPException:
         raise
@@ -475,7 +480,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def on_startup():
     rbg = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
     log.info("═" * 60)
-    log.info("🚀 Kalak-Shetra AI v21.1.0 starting")
+    log.info("🚀 Kalak-Shetra AI v21.2.0 starting")
+    log.info(f"   Model: {GEMINI_MODEL}")
     log.info(f"   Gemini keys: {gemini_rotator.count()}")
     log.info(f"   remove.bg: {'✅' if rbg else '❌'}")
     log.info("═" * 60)
