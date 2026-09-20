@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  KALAK-SHETRA AI — FastAPI backend (Gemini + remove.bg only)
-#  v21.2.0 — Updated to gemini-3.6-flash
+#  KALAK-SHETRA AI — FastAPI backend
+#  v21.3.0 — Gemini · remove.bg · FCM Push Notifications · Admin Panel
 # ═══════════════════════════════════════════════════════════════════════════
 import os
 import io
@@ -10,8 +10,13 @@ import base64
 import logging
 import traceback
 from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
 
 import httpx
+import jwt as _jwt
+import firebase_admin
+from firebase_admin import credentials, firestore as fb_firestore
+
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -23,6 +28,7 @@ try:
 except ImportError:
     pass
 
+
 # ─── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -30,14 +36,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("kalak-shetra")
 
-# ─── Model name (single source of truth) ──────────────────────────────────
-GEMINI_MODEL = "gemini-3.6-flash"
 
-# ─── App ──────────────────────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────────
+GEMINI_MODEL = "gemini-3.6-flash"
+APP_VERSION = "21.3.0"
+ANDROID_CHANNEL_ID = "kalakriti_updates"
+
+
+# ─── FastAPI App ──────────────────────────────────────────────────────────
 app = FastAPI(
     title="Kalak-Shetra AI",
     description="AI backend for Kalakriti artisan marketplace",
-    version="21.2.0",
+    version=APP_VERSION,
 )
 
 app.add_middleware(
@@ -50,7 +60,7 @@ app.add_middleware(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ENV HELPERS  (case-insensitive lookup)
+#  ENV HELPERS  (case-insensitive)
 # ═══════════════════════════════════════════════════════════════════════════
 def env_get(*names: str) -> Optional[str]:
     """Return the first non-empty env var matching any of the given names (case-insensitive)."""
@@ -72,8 +82,7 @@ def env_get(*names: str) -> Optional[str]:
 class GeminiKeyRotator:
     """
     Round-robin over multiple Gemini API keys.
-    Reads env vars: GEMINI_API_KEY_1 ... GEMINI_API_KEY_9 (+ GEMINI_API_KEY fallback)
-    Case-insensitive: gemini_api_1, GEMINI_API_KEY_1, Gemini_Api_1 all work.
+    Reads: GEMINI_API_KEY_1 ... GEMINI_API_KEY_9 (+ GEMINI_API_KEY fallback)
     """
     def __init__(self):
         self.keys: List[str] = []
@@ -201,8 +210,25 @@ def gemini_generate(
     )
 
 
+def _parse_json_response(raw: str) -> dict:
+    """Strip markdown fences and parse JSON from Gemini."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(raw[start:end + 1])
+        raise
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  MODELS
+#  PYDANTIC MODELS
 # ═══════════════════════════════════════════════════════════════════════════
 class ChatMessage(BaseModel):
     role: str
@@ -224,18 +250,39 @@ class PricePredictRequest(BaseModel):
     category: str = "Handicrafts"
 
 
+class VoiceListingRequest(BaseModel):
+    text: str
+    source_lang: str = "te-IN"
+
+
+class NotifyRequest(BaseModel):
+    title: str
+    body: str
+    topic: str = "all_users"
+    image_url: Optional[str] = None
+
+
+class ScheduleRequest(BaseModel):
+    title: str
+    body: str
+    topic: str = "all_users"
+    send_at: str  # ISO8601
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  ROOT / HEALTH / DEBUG
+#  ROOT / HEALTH / DEBUG / VERSION
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/")
 async def root():
     return {
         "status": "ok",
         "service": "kalak-shetra-ai",
-        "version": "21.2.0",
+        "version": APP_VERSION,
         "model": GEMINI_MODEL,
         "gemini_keys": gemini_rotator.count(),
         "removebg_configured": bool(env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")),
+        "fcm_configured": bool(os.getenv("FCM_SERVICE_ACCOUNT")),
+        "admin_secret_set": bool(os.getenv("ADMIN_SECRET")),
     }
 
 
@@ -249,7 +296,7 @@ async def debug():
     rbg = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
     return {
         "service": "kalak-shetra-ai",
-        "version": "21.2.0",
+        "version": APP_VERSION,
         "model": GEMINI_MODEL,
         "gemini": {
             "total_keys": gemini_rotator.count(),
@@ -259,11 +306,24 @@ async def debug():
             "configured": bool(rbg),
             "key_suffix": (rbg or "")[-6:],
         },
+        "fcm": {"configured": bool(os.getenv("FCM_SERVICE_ACCOUNT"))},
+        "admin": {"secret_set": bool(os.getenv("ADMIN_SECRET"))},
+    }
+
+
+@app.get("/version")
+async def version():
+    """Latest app version — checked by the app on launch for updates."""
+    return {
+        "latest": "1.1.0",
+        "min_supported": "1.0.0",
+        "url": "https://github.com/darahas476-ux/kalak-shetra-ai/releases/latest/download/app-release.apk",
+        "notes": "🎉 Voice listings · Faster AI · Better UX",
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  /analyze-product
+#  AI ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════
 @app.post("/analyze-product")
 async def analyze_product(
@@ -295,23 +355,8 @@ Return JSON with these exact keys:
 
 Return only the JSON."""
 
-        raw = gemini_generate(prompt, image_bytes=img_bytes).strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start != -1 and end > start:
-                parsed = json.loads(raw[start : end + 1])
-            else:
-                raise
-
+        raw = gemini_generate(prompt, image_bytes=img_bytes)
+        parsed = _parse_json_response(raw)
         return JSONResponse(parsed)
 
     except HTTPException:
@@ -321,11 +366,9 @@ Return only the JSON."""
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  /enhance — remove background
-# ═══════════════════════════════════════════════════════════════════════════
 @app.post("/enhance")
 async def enhance(file: UploadFile = File(...)):
+    """Remove background using remove.bg"""
     try:
         api_key = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
         if not api_key:
@@ -361,9 +404,6 @@ async def enhance(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  /chat
-# ═══════════════════════════════════════════════════════════════════════════
 @app.post("/chat")
 async def chat(req: ChatRequest):
     try:
@@ -395,9 +435,6 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  /predict-price
-# ═══════════════════════════════════════════════════════════════════════════
 @app.post("/predict-price")
 async def predict_price(req: PricePredictRequest):
     try:
@@ -415,20 +452,8 @@ Return ONLY valid JSON:
   "reasoning": "one sentence in English"
 }}"""
 
-        raw = gemini_generate(prompt).strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            parsed = json.loads(raw[start : end + 1]) if start != -1 and end > start else {}
-
+        raw = gemini_generate(prompt)
+        parsed = _parse_json_response(raw)
         return JSONResponse(parsed)
 
     except HTTPException:
@@ -444,9 +469,6 @@ Return ONLY valid JSON:
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  /translate
-# ═══════════════════════════════════════════════════════════════════════════
 @app.post("/translate")
 async def translate(req: TranslateRequest):
     try:
@@ -462,6 +484,239 @@ async def translate(req: TranslateRequest):
     except Exception as e:
         log.error(f"/translate error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/translate-and-analyze")
+async def translate_and_analyze(req: VoiceListingRequest):
+    """
+    Take artisan's native-language voice text, translate to English,
+    and generate a full listing.
+    """
+    try:
+        prompt = f"""You are an AI assistant for Indian artisans.
+
+The artisan spoke in {req.source_lang}. Transcript:
+"{req.text}"
+
+Translate and generate a complete listing.
+
+Return ONLY valid JSON:
+{{
+  "original_text": "{req.text}",
+  "english_translation": "accurate English translation",
+  "title": "catchy title (max 60 chars)",
+  "description_en": "2-3 sentence English marketing description",
+  "description_native": "same description in original language",
+  "category": "one of: Sarees, Dresses, Handicrafts, Jewelry",
+  "price_low": integer INR,
+  "price_high": integer INR,
+  "tags": ["tag1", "tag2", "tag3"],
+  "confidence": 0.0 to 1.0
+}}
+
+Return only JSON."""
+
+        raw = gemini_generate(prompt)
+        parsed = _parse_json_response(raw)
+        return JSONResponse(parsed)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/translate-and-analyze error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FCM PUSH NOTIFICATIONS
+# ═══════════════════════════════════════════════════════════════════════════
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+
+
+def _verify_admin(secret: str):
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden: bad admin secret")
+
+
+def _init_firebase_admin():
+    """Init Firebase Admin SDK from env JSON. Returns Firestore client."""
+    sa_json = os.getenv("FCM_SERVICE_ACCOUNT")
+    if not sa_json:
+        raise HTTPException(status_code=500, detail="FCM_SERVICE_ACCOUNT not set")
+
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(json.loads(sa_json))
+        firebase_admin.initialize_app(cred)
+
+    return fb_firestore.client()
+
+
+def _get_fcm_access_token() -> str:
+    """Get FCM OAuth2 token from service account JSON."""
+    sa_json = os.getenv("FCM_SERVICE_ACCOUNT")
+    if not sa_json:
+        raise HTTPException(status_code=500, detail="FCM_SERVICE_ACCOUNT not set")
+
+    sa = json.loads(sa_json)
+    now = int(time.time())
+    payload = {
+        "iss": sa["client_email"],
+        "scope": "https://www.googleapis.com/auth/firebase.messaging",
+        "aud": "https://oauth2.googleapis.com/token",
+        "iat": now,
+        "exp": now + 3600,
+    }
+    signed = _jwt.encode(payload, sa["private_key"], algorithm="RS256")
+
+    resp = httpx.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": signed,
+        },
+        timeout=10,
+    )
+    return resp.json()["access_token"]
+
+
+def _send_fcm(topic: str, title: str, body: str, image_url: Optional[str] = None) -> dict:
+    """Send a single FCM push to a topic with custom vibration."""
+    sa_json = os.getenv("FCM_SERVICE_ACCOUNT")
+    if not sa_json:
+        return {"ok": False, "error": "FCM_SERVICE_ACCOUNT not set"}
+
+    sa = json.loads(sa_json)
+    project_id = sa["project_id"]
+
+    try:
+        token = _get_fcm_access_token()
+
+        notification: Dict[str, Any] = {"title": title, "body": body}
+        if image_url:
+            notification["image"] = image_url
+
+        message = {
+            "message": {
+                "topic": topic,
+                "notification": notification,
+                "android": {
+                    "priority": "HIGH",
+                    "notification": {
+                        "channel_id": ANDROID_CHANNEL_ID,
+                        "sound": "default",
+                        "default_vibrate_timings": False,
+                        "vibrate_timings": [
+                            "0s", "0.5s", "0.2s",
+                            "0.4s", "0.2s", "0.6s",
+                        ],
+                    },
+                },
+                "apns": {
+                    "payload": {"aps": {"sound": "default", "badge": 1}},
+                },
+            }
+        }
+
+        resp = httpx.post(
+            f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=message,
+            timeout=15,
+        )
+        ok = resp.status_code == 200
+        log.info(f"FCM send to '{topic}': {resp.status_code} {resp.text[:120]}")
+        return {"ok": ok, "response": resp.json()}
+    except Exception as e:
+        log.error(f"FCM send failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/notify")
+async def notify(req: NotifyRequest, secret: str = ""):
+    """Send a push notification to a topic immediately."""
+    _verify_admin(secret)
+    result = _send_fcm(req.topic, req.title, req.body, req.image_url)
+
+    # Log to Firestore
+    try:
+        db = _init_firebase_admin()
+        db.collection("notification_log").add({
+            "title": req.title,
+            "body": req.body,
+            "topic": req.topic,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "result": str(result),
+        })
+    except Exception as e:
+        log.warning(f"Notification log failed: {e}")
+
+    return result
+
+
+@app.post("/schedule")
+async def schedule(req: ScheduleRequest, secret: str = ""):
+    """Schedule a notification for later. Stored in Firestore."""
+    _verify_admin(secret)
+    db = _init_firebase_admin()
+
+    doc_ref = db.collection("scheduled_notifications").document()
+    doc_ref.set({
+        "title": req.title,
+        "body": req.body,
+        "topic": req.topic,
+        "send_at": req.send_at,
+        "sent": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    return {"ok": True, "id": doc_ref.id, "send_at": req.send_at}
+
+
+@app.get("/check-scheduled")
+async def check_scheduled():
+    """Fire any due notifications. Called by GitHub Action cron every 15 min."""
+    try:
+        db = _init_firebase_admin()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        docs = db.collection("scheduled_notifications") \
+            .where("sent", "==", False) \
+            .where("send_at", "<=", now_iso) \
+            .stream()
+
+        fired = []
+        for doc in docs:
+            d = doc.to_dict()
+            result = _send_fcm(d["topic"], d["title"], d["body"])
+            doc.reference.update({
+                "sent": True,
+                "sent_at": now_iso,
+                "result": str(result),
+            })
+            fired.append({"id": doc.id, "result": result})
+
+        log.info(f"check-scheduled: fired {len(fired)}")
+        return {"ok": True, "fired": len(fired), "details": fired}
+    except Exception as e:
+        log.error(f"check-scheduled error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/notifications")
+async def list_notifications(secret: str = "", limit: int = 50):
+    """List recent notification history (admin only)."""
+    _verify_admin(secret)
+    try:
+        db = _init_firebase_admin()
+        docs = db.collection("notification_log") \
+            .order_by("sent_at", direction=fb_firestore.Query.DESCENDING) \
+            .limit(limit) \
+            .stream()
+        return {"ok": True, "items": [{"id": d.id, **d.to_dict()} for d in docs]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -480,10 +735,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def on_startup():
     rbg = env_get("REMOVEBG_API_KEY", "remove_bg", "REMOVE_BG_API_KEY")
     log.info("═" * 60)
-    log.info("🚀 Kalak-Shetra AI v21.2.0 starting")
+    log.info(f"🚀 Kalak-Shetra AI v{APP_VERSION} starting")
     log.info(f"   Model: {GEMINI_MODEL}")
     log.info(f"   Gemini keys: {gemini_rotator.count()}")
     log.info(f"   remove.bg: {'✅' if rbg else '❌'}")
+    log.info(f"   FCM: {'✅' if os.getenv('FCM_SERVICE_ACCOUNT') else '❌'}")
+    log.info(f"   Admin secret: {'✅' if ADMIN_SECRET else '❌'}")
     log.info("═" * 60)
 
 
